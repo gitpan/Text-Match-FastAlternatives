@@ -2,11 +2,6 @@
 #include "perl.h"
 #include "XSUB.h"
 
-/* An improvement would be to get the minimum match length of all the strings
- * being sought and verify that we have enough characters left in the target
- * string.  But in the context I'm using this, the minimum match length is 3,
- * so we'd only save two function calls per failed match. */
-
 /* Support older versions of perl. */
 #ifndef Newxz
 #define Newxz(ptr, n, type) Newz(704, ptr, n, type)
@@ -32,17 +27,21 @@ static void free_trie(struct trie_node *node) {
 
 static int trie_match(struct trie_node *node, const char *s, I32 len) {
     unsigned char c;
-    struct trie_node *next;
 
-    if (node->final)
-        return 1;
-    if (len == 0)
-        return 0;
-    c = *s;
-    if (c < 32 || c >= 127)
-        return 0;
-    next = node->next[c - 32];
-    return next ? trie_match(next, s + 1, len - 1) : 0;
+    for (;;) {
+        if (node->final)
+            return 1;
+        if (len == 0)
+            return 0;
+        c = *s;
+        if (c < 32 || c >= 127)
+            return 0;
+        node = node->next[c - 32];
+        if (!node)
+            return 0;
+        s++;
+        len--;
+    }
 }
 
 MODULE = Text::Match::FastAlternatives      PACKAGE = Text::Match::FastAlternatives
@@ -52,9 +51,10 @@ PROTOTYPES: DISABLE
 Text::Match::FastAlternatives
 new(package, ...)
     char *package
-    CODE:
+    PREINIT:
         struct trie_node *root;
         I32 i;
+    CODE:
         for (i = 1;  i < items;  i++) {
             SV *sv = ST(i);
             STRLEN pos, len;
@@ -97,12 +97,13 @@ int
 match(trie, targetsv)
     Text::Match::FastAlternatives trie
     SV *targetsv
+    PREINIT:
+        STRLEN target_len;
+        char *target;
     INIT:
         if (!SvOK(targetsv))
             croak("Target is not a defined scalar");
     CODE:
-        STRLEN target_len;
-        char *target;
         target = SvPV(targetsv, target_len);
         do {
             if (trie_match(trie, target, target_len))
