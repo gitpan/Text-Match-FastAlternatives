@@ -1,3 +1,5 @@
+/* -*- c -*- */
+
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
@@ -7,62 +9,145 @@
 #define Newxz(ptr, n, type) Newz(704, ptr, n, type)
 #endif
 
-#define MAX_NODES 95
-
-struct trie_node;
-struct trie_node {
-    int final;
-    struct trie_node *next[MAX_NODES];
+struct node;
+struct node {
+    unsigned short size;        /* total "next" pointers (incl static one) */
+    unsigned char min;          /* codepoint of next[0] */
+    unsigned char final;
+    struct node *next[1];       /* really a variable-length array */
 };
 
-typedef struct trie_node *Text__Match__FastAlternatives;
+struct trie {
+    struct node *root;
+    int has_unicode;
+};
+
+#define BIGNODE_MAX 256
+struct bignode;
+struct bignode {
+    unsigned final;
+    struct bignode *next[BIGNODE_MAX]; /* one for every possible byte */
+};
+
+typedef struct trie *Text__Match__FastAlternatives;
+
+#define DEF_FREE(type, free_trie, limit)        \
+    static void                                 \
+    free_trie(type *node) {                     \
+        unsigned int i;                         \
+        for (i = 0;  i < limit;  i++)           \
+            if (node->next[i])                  \
+                free_trie(node->next[i]);       \
+        Safefree(node);                         \
+    }
+
+DEF_FREE(struct    node, free_trie, node->size)
+DEF_FREE(struct bignode, free_bigtrie, BIGNODE_MAX)
+
+#define DEF_MATCH(trie_match, return_when_done)                         \
+    static int                                                          \
+    trie_match(const struct node *node, const U8 *s, STRLEN len) {      \
+        unsigned char c, offset;                                        \
+                                                                        \
+        for (;;) {                                                      \
+            return_when_done;                                           \
+            c = *s;                                                     \
+            offset = c - node->min;                                     \
+            if (offset > c || offset >= node->size)                     \
+                return 0;                                               \
+            node = node->next[offset];                                  \
+            if (!node)                                                  \
+                return 0;                                               \
+            s++;                                                        \
+            len--;                                                      \
+        }                                                               \
+    }
+
+DEF_MATCH(trie_match,
+          if (node->final)
+              return 1;
+          if (len == 0)
+              return 0)
+
+DEF_MATCH(trie_match_exact,
+          if (len == 0)
+              return node->final)
+
+static struct node *
+shrink_bigtrie(const struct bignode *big) {
+    int min = -1, max = -1, size;
+    unsigned int i;
+    struct node *node;
+    void *vnode;
+
+    for (i = 0;  i < BIGNODE_MAX;  i++) {
+        if (!big->next[i])
+            continue;
+        if (min < 0 || i < min)
+            min = i;
+        if (max < 0 || i > max)
+            max = i;
+    }
+
+    if (min == -1) {
+        min = 0;
+        max = 0;
+    }
+
+    size = max - min + 1;
+    Newxz(vnode, sizeof(struct node) + (size-1) * sizeof(struct node *), char);
+    node = vnode;
+
+    node->final = big->final;
+    node->min = min;
+    node->size = size;
+
+    for (i = min;  i < BIGNODE_MAX;  i++)
+        if (big->next[i])
+            node->next[i - min] = shrink_bigtrie(big->next[i]);
+
+    return node;
+}
+
+static int
+trie_has_unicode(const struct node *node) {
+    unsigned int i;
+    if (node->min + node->size > 0x7F)
+        return 1;
+    for (i = 0;  i < node->size;  i++)
+        if (node->next[i] && trie_has_unicode(node->next[i]))
+            return 1;
+    return 0;
+}
 
 static void
-free_trie(struct trie_node *node) {
+trie_dump(const char *prev, I32 prev_len, const struct node *node) {
     unsigned int i;
-    for (i = 0;  i < MAX_NODES;  i++)
+    unsigned int entries = 0;
+    char *state;
+    for (i = 0;  i < node->size;  i++)
         if (node->next[i])
-            free_trie(node->next[i]);
-    Safefree(node);
+            entries++;
+    /* XXX: This relies on the %lc printf format, which only works in C99,
+     * so the corresponding method isn't documented at the moment. */
+    printf("[%s]: min=%u[%lc] size=%u final=%u entries=%u\n", prev, node->min,
+           node->min, node->size, node->final, entries);
+    Newxz(state, prev_len + 3, char);
+    strcpy(state, prev);
+    for (i = 0;  i < node->size;  i++)
+        if (node->next[i]) {
+            int n = sprintf(state + prev_len, "%lc", i + node->min);
+            trie_dump(state, prev_len + n, node->next[i]);
+        }
+    Safefree(state);
 }
 
-static int
-trie_match(struct trie_node *node, const char *s, STRLEN len) {
-    unsigned char c;
-
-    for (;;) {
-        if (node->final)
-            return 1;
-        if (len == 0)
-            return 0;
-        c = *s;
-        if (c < 32 || c >= 127)
-            return 0;
-        node = node->next[c - 32];
-        if (!node)
-            return 0;
-        s++;
-        len--;
-    }
-}
-
-static int
-trie_match_exact(struct trie_node *node, const char *s, STRLEN len) {
-    unsigned char c;
-
-    for (;;) {
-        if (len == 0)
-            return node->final;
-        c = *s;
-        if (c < 32 || c >= 127)
-            return 0;
-        node = node->next[c - 32];
-        if (!node)
-            return 0;
-        s++;
-        len--;
-    }
-}
+/* If the trie used Unicode, make sure that the target string uses the same
+ * encoding.  But if the trie didn't use Unicode, it doesn't matter what
+ * encoding the target uses for any supra-ASCII characters it contains,
+ * because they'll never be found in the trie. */
+#define GET_TARGET(trie, sv, len) \
+    trie->has_unicode ? SvPVutf8(sv, len) : SvPV(sv, len)
 
 MODULE = Text::Match::FastAlternatives      PACKAGE = Text::Match::FastAlternatives
 
@@ -72,46 +157,43 @@ Text::Match::FastAlternatives
 new(package, ...)
     char *package
     PREINIT:
-        struct trie_node *root;
+        struct bignode *root;
+        struct trie *trie;
         I32 i;
     CODE:
         for (i = 1;  i < items;  i++) {
             SV *sv = ST(i);
-            STRLEN pos, len;
-            char *s;
             if (!SvOK(sv))
-                croak("Undefined element in Text::Match::FastAlternatives->new");
-            s = SvPV(sv, len);
-            for (pos = 0;  pos < len;  pos++) {
-                if (s[pos] >= 0 && (s[pos] < 32 || s[pos] == 127))
-                    croak("Control character in Text::Match::FastAlternatives string");
-                if (s[pos] < 32 || s[pos] >= 127)
-                    croak("Non-ASCII character in Text::Match::FastAlternatives string");
-            }
+                croak("Undefined element in %s->new", package);
         }
-        Newxz(root, 1, struct trie_node);
+        Newxz(root, 1, struct bignode);
         for (i = 1;  i < items;  i++) {
             STRLEN pos, len;
             SV *sv = ST(i);
-            char *s = SvPV(sv, len);
-            struct trie_node *node = root;
+            char *s = SvPVutf8(sv, len);
+            struct bignode *node = root;
             for (pos = 0;  pos < len;  pos++) {
-                unsigned char c = s[pos] - 32;
+                unsigned char c = s[pos];
                 if (!node->next[c])
-                    Newxz(node->next[c], 1, struct trie_node);
+                    Newxz(node->next[c], 1, struct bignode);
                 node = node->next[c];
             }
             node->final = 1;
         }
-    RETVAL = root;
+        Newxz(trie, 1, struct trie);
+        trie->root = shrink_bigtrie(root);
+        trie->has_unicode = trie_has_unicode(trie->root);
+        free_bigtrie(root);
+        RETVAL = trie;
     OUTPUT:
-    RETVAL
+        RETVAL
 
 void
 DESTROY(trie)
     Text::Match::FastAlternatives trie
     CODE:
-        free_trie(trie);
+        free_trie(trie->root);
+        Safefree(trie);
 
 int
 match(trie, targetsv)
@@ -124,9 +206,9 @@ match(trie, targetsv)
         if (!SvOK(targetsv))
             croak("Target is not a defined scalar");
     CODE:
-        target = SvPV(targetsv, target_len);
+        target = GET_TARGET(trie, targetsv, target_len);
         do {
-            if (trie_match(trie, target, target_len))
+            if (trie_match(trie->root, target, target_len))
                 XSRETURN_YES;
             target++;
         } while (target_len-- > 0);
@@ -144,11 +226,11 @@ match_at(trie, targetsv, pos)
         if (!SvOK(targetsv))
             croak("Target is not a defined scalar");
     CODE:
-        target = SvPV(targetsv, target_len);
+        target = GET_TARGET(trie, targetsv, target_len);
         if (pos <= target_len) {
             target_len -= pos;
             target += pos;
-            if (trie_match(trie, target, target_len))
+            if (trie_match(trie->root, target, target_len))
                 XSRETURN_YES;
         }
         XSRETURN_NO;
@@ -164,7 +246,13 @@ exact_match(trie, targetsv)
         if (!SvOK(targetsv))
             croak("Target is not a defined scalar");
     CODE:
-        target = SvPV(targetsv, target_len);
-        if (trie_match_exact(trie, target, target_len))
+        target = GET_TARGET(trie, targetsv, target_len);
+        if (trie_match_exact(trie->root, target, target_len))
             XSRETURN_YES;
         XSRETURN_NO;
+
+void
+dump(trie)
+    Text::Match::FastAlternatives trie
+    CODE:
+        trie_dump("", 0, trie->root);
