@@ -142,10 +142,37 @@ trie_dump(const char *prev, I32 prev_len, const struct node *node) {
     Safefree(state);
 }
 
+static int get_byte_offset(SV *sv, int pos) {
+    STRLEN len;
+    char *s;
+    unsigned char *p;
+    if (!SvUTF8(sv))
+        return pos;
+    s = SvPV(sv, len);
+    for (p = s;  pos > 0;  pos--) {
+        /* Skip the sole byte (ASCII char) or leading byte (top >=2 bits set) */
+        p++;
+        /* Skip any continuation bytes (top bit set but not next bit) */
+        while ((*p & 0xC0u) == 0x80u)
+            p++;
+    }
+    return p - (unsigned char *) s;
+}
+
 /* If the trie used Unicode, make sure that the target string uses the same
  * encoding.  But if the trie didn't use Unicode, it doesn't matter what
  * encoding the target uses for any supra-ASCII characters it contains,
- * because they'll never be found in the trie. */
+ * because they'll never be found in the trie.
+ *
+ * A pleasing performance enhancement would be as follows: delay upgrading a
+ * byte-encoded SV until such time as we're actually looking at a
+ * supra-ASCII character; then upgrade the SV, and start again from the
+ * current offset in the string.  (Since by definition there are't any
+ * supra-ASCII characters before the current offset, it's guaranteed to be
+ * safe to use the old characters==bytes-style offset as a byte-oriented one
+ * for the upgraded SV.)  It seems a little tricky to arrange that sort of
+ * switcheroo, though; the inner loop is in a function that knows nothing of
+ * SVs or encodings. */
 #define GET_TARGET(trie, sv, len) \
     trie->has_unicode ? SvPVutf8(sv, len) : SvPV(sv, len)
 
@@ -227,6 +254,7 @@ match_at(trie, targetsv, pos)
             croak("Target is not a defined scalar");
     CODE:
         target = GET_TARGET(trie, targetsv, target_len);
+        pos = get_byte_offset(targetsv, pos);
         if (pos <= target_len) {
             target_len -= pos;
             target += pos;

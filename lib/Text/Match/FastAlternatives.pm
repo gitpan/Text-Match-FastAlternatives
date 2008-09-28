@@ -3,10 +3,10 @@ package Text::Match::FastAlternatives;
 use strict;
 use warnings;
 
-our $VERSION = '1.03';
-use base qw<DynaLoader>;
+our $VERSION = '1.04';
 
-__PACKAGE__->bootstrap($VERSION);
+use XSLoader;
+XSLoader::load(__PACKAGE__, $VERSION);
 
 1;
 
