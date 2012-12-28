@@ -1,5 +1,5 @@
 use ExtUtils::MakeMaker;
-use 5.006;
+use 5.008;
 my $module_file = 'lib/Text/Match/FastAlternatives.pm';
 WriteMakefile(
     NAME          => 'Text::Match::FastAlternatives',
@@ -7,4 +7,7 @@ WriteMakefile(
     ABSTRACT_FROM => $module_file,
     VERSION_FROM  => $module_file,
     OBJECT        => 'FastAlternatives.o',
+    depend => {
+        'FastAlternatives.o' => 'trie.c',
+    },
 );
